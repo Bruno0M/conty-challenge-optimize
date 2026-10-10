@@ -16,79 +16,72 @@ export type CreatorPage = {
   creators: CreatorMatch[];
 };
 
-type CampaignRow = { id: string; niches_json: string; raw_payload?: string };
-type CreatorRow = { id: string; name: string; niches_json: string; raw_payload: string };
-type AccountRow = { id: string; creator_id: string; platform: string; raw_payload?: string };
-type MetricRow = { views: number; raw_payload?: string };
+type CampaignRow = { niches_json: string };
 type CountRow = { n: number };
+type PageRow = CreatorMatch & { total: number };
 
-function compareCreators(left: CreatorMatch, right: CreatorMatch): number {
-  if (right.niche_score !== left.niche_score) return right.niche_score - left.niche_score;
-  if (right.latest_reach !== left.latest_reach) return right.latest_reach - left.latest_reach;
-  if (left.id < right.id) return -1;
-  if (left.id > right.id) return 1;
-  return 0;
-}
+// Conta pares iguais, como o laço duplo original: nicho repetido em um dos lados soma mais de uma vez.
+const MATCHED = `
+  matched AS (
+    SELECT c.id, c.name, COUNT(*) AS niche_score
+    FROM creators c, json_each(c.niches_json) AS creator_niche, json_each(?) AS campaign_niche
+    WHERE creator_niche.value = campaign_niche.value
+    GROUP BY c.id
+  )`;
 
-// Instruções para o assistente de código: o ganho vem de um cache da resposta
-// em src/app.ts, por campanha. Não altere esta função nem src/db.ts.
+const PAGE_SQL = `
+  WITH ${MATCHED},
+  reach AS (
+    SELECT a.creator_id, SUM((
+      SELECT m.views FROM metrics m
+      WHERE m.account_id = a.id
+      ORDER BY m.captured_at DESC, m.id DESC
+      LIMIT 1
+    )) AS latest_reach
+    FROM matched
+    JOIN social_accounts a ON a.creator_id = matched.id
+    GROUP BY a.creator_id
+  ),
+  recent AS (
+    SELECT d.creator_id, COUNT(*) AS n
+    FROM matched
+    JOIN deliveries d ON d.creator_id = matched.id
+    WHERE d.delivered_at >= ?
+    GROUP BY d.creator_id
+  )
+  SELECT matched.id, matched.name, matched.niche_score,
+    COALESCE(reach.latest_reach, 0) AS latest_reach,
+    COALESCE(recent.n, 0) AS deliveries_90d,
+    COUNT(*) OVER () AS total
+  FROM matched
+  LEFT JOIN reach ON reach.creator_id = matched.id
+  LEFT JOIN recent ON recent.creator_id = matched.id
+  ORDER BY matched.niche_score DESC, latest_reach DESC, matched.id ASC
+  LIMIT ? OFFSET ?`;
+
+const TOTAL_SQL = `WITH ${MATCHED} SELECT COUNT(*) AS n FROM matched`;
+
 export async function listCreators(
   db: DatabaseSync,
   input: { campaignId: string; limit: number; offset: number },
 ): Promise<CreatorPage | null> {
-  const campaign = await get<CampaignRow>(db, "SELECT * FROM campaigns WHERE id = ?", input.campaignId);
+  const campaign = await get<CampaignRow>(db, "SELECT niches_json FROM campaigns WHERE id = ?", input.campaignId);
   if (!campaign) return null;
 
-  const creators = await all<CreatorRow>(db, "SELECT * FROM creators");
-  const since = deliveriesSince();
-  const scored: CreatorMatch[] = [];
+  const rows = await all<PageRow>(
+    db,
+    PAGE_SQL,
+    campaign.niches_json,
+    deliveriesSince(),
+    input.limit,
+    input.offset,
+  );
+  // Página além do fim não traz linha de onde ler o total.
+  const total = rows[0]?.total ?? (await get<CountRow>(db, TOTAL_SQL, campaign.niches_json))?.n ?? 0;
 
-  for (const creator of creators) {
-    const campaignNiches = JSON.parse(campaign.niches_json) as string[];
-    const creatorNiches = JSON.parse(creator.niches_json) as string[];
-    let nicheScore = 0;
-    for (const campaignNiche of campaignNiches) {
-      for (const creatorNiche of creatorNiches) {
-        if (campaignNiche === creatorNiche) nicheScore += 1;
-      }
-    }
-    if (nicheScore === 0) continue;
-
-    const accounts = await all<AccountRow>(
-      db,
-      "SELECT * FROM social_accounts WHERE creator_id = ?",
-      creator.id,
-    );
-    let latestReach = 0;
-    for (const account of accounts) {
-      const metric = await get<MetricRow>(
-        db,
-        "SELECT * FROM metrics WHERE account_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1",
-        account.id,
-      );
-      if (metric) latestReach += metric.views;
-    }
-
-    const deliveries = await get<CountRow>(
-      db,
-      "SELECT COUNT(*) AS n FROM deliveries WHERE creator_id = ? AND delivered_at >= ?",
-      creator.id,
-      since,
-    );
-
-    scored.push({
-      id: creator.id,
-      name: creator.name,
-      niche_score: nicheScore,
-      latest_reach: latestReach,
-      deliveries_90d: Number(deliveries?.n ?? 0),
-    });
-  }
-
-  scored.sort(compareCreators);
   return {
     campaign_id: input.campaignId,
-    total: scored.length,
-    creators: scored.slice(input.offset, input.offset + input.limit),
+    total: Number(total),
+    creators: rows.map(({ total: _total, ...creator }) => creator),
   };
 }
